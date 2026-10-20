@@ -669,6 +669,9 @@ function buildCcRequest(openaiReq) {
   for (let i = 0; i < systemBlocks.length - 1; i++) systemBlocks[i].text += '\n';
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
+  // 跟踪是否存在缺少 reasoning 的 assistant 历史消息，用于决定是否回退禁用 thinking 模式。
+  let hasMissingReasoning = false;
+
   // Build tool_call_id → tool_name reverse lookup
   // 名字原样透传（理由见 toWireToolName 删除处的注释）。
   const toolNameMap = {};
@@ -710,8 +713,27 @@ function buildCcRequest(openaiReq) {
       // 思考内容必须回传：CC 在 thinking 模式下校验 reasoning 是否随历史带回，
       // 丢弃会让上游直接拒绝。次序也必须与 CC CLI 的抓包格式一致 ——
       // [reasoning, text, tool-call]，reasoning 在最前。
-      if (msg.reasoning_content) {
-        parts.push({ type: 'reasoning', text: msg.reasoning_content });
+      // 推理模型可能要求历史 assistant 消息带 reasoning_content；但凭空制造 reasoning
+      // 会改变语义且可能被上游拒绝，因此这里不再用空串补齐，仅保留真实存在的
+      // reasoning。缺失时记录 hasMissingReasoning，供后续回退禁用 thinking 模式。
+      let reasoningText = null;
+      if (typeof msg.reasoning_content === 'string') reasoningText = msg.reasoning_content;
+      else if (msg.reasoning_content != null) reasoningText = String(msg.reasoning_content);
+      let reasoningAlreadyInContent = false;
+      if (reasoningText === null && Array.isArray(msg.content)) {
+        const rpart = msg.content.find(p => p && p.type === 'reasoning');
+        if (rpart) { reasoningAlreadyInContent = true; }
+      }
+      // 协议要求每条历史 assistant 消息都带 reasoning_content（取消/部分响应
+      // 常缺字段）：缺失时用空串占位以满足上游校验，同时记 hasMissingReasoning
+      // 以便在客户端启用 thinking 时回退禁用 reasoning_effort，避免语义不匹配。
+      // shortcut: 空串占位可能被严格上游拒绝，必要时改为丢弃该轮或透传 null；仅在取消/缺字段场景触发。
+      if (reasoningText === null && !reasoningAlreadyInContent) {
+        reasoningText = '';
+        hasMissingReasoning = true;
+      }
+      if (reasoningText !== null) {
+        parts.push({ type: 'reasoning', text: reasoningText });
       }
       if (msg.content && typeof msg.content === 'string') {
         if (msg.content) parts.push({ type: 'text', text: msg.content });
@@ -721,7 +743,7 @@ function buildCcRequest(openaiReq) {
           if (part.type === 'text') parts.push(part);
           // 客户端直接把 reasoning 放在 content 数组里时同样透传；
           // 已有 reasoning_content 字段则不重复
-          else if (part.type === 'reasoning' && !msg.reasoning_content) parts.push(part);
+          else if (part.type === 'reasoning' && reasoningText === null) parts.push(part);
         }
       }
       if (msg.tool_calls) {
@@ -803,7 +825,10 @@ function buildCcRequest(openaiReq) {
   if (temperature !== undefined) {
     body.params.temperature = temperature;
   }
-  if (reasoning_effort !== undefined) {
+  // 回退策略：若存在缺少 reasoning 的 assistant 历史消息且客户端启用了 thinking
+  // 模式，上游会因缺少 reasoning_content 而拒绝；此时禁用 thinking 模式（不下发
+  // reasoning_effort）作为有效回退，而非凭空制造 reasoning。
+  if (reasoning_effort !== undefined && !hasMissingReasoning) {
     body.params.reasoning_effort = reasoning_effort;
   }
   // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
